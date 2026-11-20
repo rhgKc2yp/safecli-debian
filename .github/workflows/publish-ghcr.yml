@@ -32,6 +32,8 @@ jobs:
       - name: Test shell and publisher rules
         run: |
           bash -n safecli.sh scripts/promote-image.sh scripts/install-cli-toolchain.sh scripts/generate-sboms.sh
+          python3 -m py_compile scripts/verify-trivy-setuptools.py
+          python3 tests/test-trivy-waiver.py
           bash tests/test-containerfiles.sh
           bash tests/test-security-updates.sh
           bash tests/test-debian-updates.sh
@@ -100,9 +102,11 @@ jobs:
       - name: Install Trivy
         uses: aquasecurity/setup-trivy@e07451d2e059ed86c2870430ea286b3a9e0bf241
         with:
-          version: v0.76.2
+          # Follow upstream on each run, including the existing every-third-day schedule.
+          version: latest
 
-      - name: Scan both architectures (block fixable HIGH / CRITICAL)
+      - name: Scan both architectures (preserve all raw findings)
+        id: trivy_scan
         shell: bash
         env:
           IMAGE: ${{ steps.image.outputs.name }}
@@ -110,27 +114,31 @@ jobs:
           TRIVY_USERNAME: ${{ github.actor }}
           TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
+          trivy --version
           mkdir -p reports
-          failed=0
           for arch in amd64 arm64; do
             echo "Scanning linux/$arch"
-            if ! trivy image \
+            # Findings go to JSON for the precise gate below; scanner errors
+            # still exit nonzero and stop publication immediately.
+            trivy image \
               --platform "linux/$arch" \
               --scanners vuln \
               --severity HIGH,CRITICAL \
               --ignore-unfixed \
-              --exit-code 1 \
+              --exit-code 0 \
               --format json \
               --output "reports/${arch}.json" \
-              "${IMAGE}@${DIGEST}"; then
-              failed=1
-            fi
+              "${IMAGE}@${DIGEST}"
           done
-          if (( failed )); then
-            echo 'Trivy detected fixable HIGH/CRITICAL vulnerabilities or scanning failed.' >&2
-          fi
-          exit "$failed"
+
+      - name: Enforce Trivy gate (verify temporary setuptools exception)
+        shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          python3 scripts/verify-trivy-setuptools.py "${IMAGE}@${DIGEST}" --profile '${{ matrix.profile }}'
 
       - name: Upload Trivy reports (even if scan fails)
         if: always() && steps.build.outcome == 'success'
@@ -207,7 +215,7 @@ jobs:
             --certificate-identity "$identity" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com >/dev/null
 
-      # Only after scanning + SBOM + provenance + signature succeed do we
+      # Only after the Trivy gate + SBOM + provenance + signature succeed do we
       # advance :latest or release version tags. The candidate remains in
       # GHCR for debugging even when a quality gate fails.
       - name: Promote verified digest to public-facing tags
@@ -260,5 +268,5 @@ jobs:
               printf '| `%s` | `%s` | `%s` |\n' "$profile" "$image" "$digest"
             done
             echo ''
-            echo 'Each image passed Trivy checks for amd64/arm64, has full downloadable SBOMs with file provenance and an image-bound SBOM digest attestation, and was keyless-signed with Cosign.'
+            echo 'Each architecture passed the Trivy vulnerability gate (which permits only a runtime-verified pip setuptools SBOM false positive), has full downloadable SBOMs with file provenance and an image-bound SBOM digest attestation, and was keyless-signed with Cosign.'
           } >> "$GITHUB_STEP_SUMMARY"
